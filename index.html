@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="A local-only PDF redaction tool that creates flattened redacted PDFs in your browser."
+    />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; worker-src 'self' blob:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'"
+    />
+    <title>Local PDF Redactor</title>
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <a class="brand" href="#" aria-label="Local PDF Redactor home">
+          <span class="brand-mark" aria-hidden="true">▰</span>
+          <span>Local PDF Redactor</span>
+        </a>
+        <div class="privacy-badge" title="Files are processed only by this browser tab">
+          <span aria-hidden="true">●</span> On-device processing
+        </div>
+        <button id="theme-toggle" class="theme-toggle" type="button" aria-pressed="true" aria-label="Switch to light mode">
+          <span id="theme-icon" aria-hidden="true">☀</span>
+          <span id="theme-label">Light mode</span>
+        </button>
+      </header>
+
+      <section class="intro" aria-labelledby="app-title">
+        <p class="eyebrow">PRIVATE BY DESIGN</p>
+        <h1 id="app-title">Redact sensitive information without uploading your PDF.</h1>
+        <p class="lede">
+          Draw blocks over the information to remove, then create a new flattened PDF. The source PDF's
+          text layer, annotations, attachments, and metadata are not carried into the exported file.
+        </p>
+      </section>
+
+      <section id="drop-zone" class="drop-zone" aria-label="Choose a PDF file">
+        <input id="file-input" type="file" accept="application/pdf,.pdf" hidden />
+        <div class="upload-icon" aria-hidden="true">↑</div>
+        <p><strong>Drop a PDF here</strong> or <button id="browse-button" class="link-button" type="button">choose a file</button></p>
+        <span>PDF files only · processed in this browser</span>
+      </section>
+
+      <section id="workspace" class="workspace" hidden aria-label="PDF editor">
+        <aside class="sidebar">
+          <div class="file-card">
+            <div class="file-icon" aria-hidden="true">PDF</div>
+            <div class="file-details">
+              <strong id="file-name">—</strong>
+              <span id="file-meta">—</span>
+            </div>
+            <button id="close-document" class="icon-button" type="button" title="Close document" aria-label="Close document">×</button>
+          </div>
+
+          <div class="sidebar-section">
+            <p class="section-label">PAGES</p>
+            <div class="page-controls">
+              <button id="previous-page" class="icon-button" type="button" aria-label="Previous page">←</button>
+              <label class="page-field" for="page-number">
+                <span class="sr-only">Current page</span>
+                <input id="page-number" type="number" min="1" value="1" inputmode="numeric" />
+                <span id="page-count">/ 1</span>
+              </label>
+              <button id="next-page" class="icon-button" type="button" aria-label="Next page">→</button>
+            </div>
+          </div>
+
+          <div class="sidebar-section instructions">
+            <p class="section-label">REDACTION TOOL</p>
+            <ol>
+              <li>Drag a box over each item to redact.</li>
+              <li>Click a block to move it, or drag its corner to resize.</li>
+              <li>Press Delete or use the button below to remove a selected block.</li>
+            </ol>
+            <button id="delete-redaction" class="secondary-button" type="button" disabled>Delete selected block</button>
+          </div>
+
+          <div class="sidebar-section quality-section">
+            <label for="quality">EXPORT QUALITY</label>
+            <select id="quality">
+              <option value="1.5">Standard (108 DPI)</option>
+              <option value="2" selected>High (144 DPI)</option>
+              <option value="3">Maximum (216 DPI)</option>
+            </select>
+            <span>Higher quality makes larger files.</span>
+          </div>
+
+          <div class="sidebar-footer">
+            <div id="redaction-count" class="redaction-count">0 blocks marked</div>
+            <button id="export-button" class="primary-button" type="button">Create redacted PDF</button>
+          </div>
+        </aside>
+
+        <section class="editor" aria-label="PDF page preview">
+          <div class="editor-toolbar">
+            <span id="page-label">Page 1</span>
+            <div class="toolbar-actions">
+              <span>Draw rectangles to redact</span>
+              <label for="zoom">Zoom</label>
+              <select id="zoom" aria-label="Preview zoom">
+                <option value="1">100%</option>
+                <option value="1.25">125%</option>
+                <option value="1.5">150%</option>
+                <option value="2">200%</option>
+              </select>
+            </div>
+          </div>
+          <div id="canvas-scroller" class="canvas-scroller">
+            <div id="page-stage" class="page-stage" aria-label="PDF page. Drag to mark redactions.">
+              <canvas id="pdf-canvas"></canvas>
+              <div id="redaction-layer" class="redaction-layer" aria-label="Redaction selection layer"></div>
+            </div>
+          </div>
+          <div id="status" class="status" role="status" aria-live="polite"></div>
+        </section>
+      </section>
+
+      <section class="security-note" aria-label="Security details">
+        <div class="security-icon" aria-hidden="true">⌁</div>
+        <div>
+          <strong>How this stays private</strong>
+          <p>Your file is read from your device into this browser tab’s memory. This app has no upload, account, analytics, cloud storage, or browser storage. Close the document or tab to clear it from the app; a PDF you download remains in your browser’s Downloads location. If Downloads syncs to a cloud service, choose a non-synced local destination for sensitive output.</p>
+        </div>
+      </section>
+    </main>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
+
