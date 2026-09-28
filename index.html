@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta
       name="description"
-      content="A local-only PDF redaction tool that creates flattened redacted PDFs in your browser."
+      content="A local-only PDF redaction tool that creates flattened redacted PDFs on your device."
     />
     <meta
       http-equiv="Content-Security-Policy"
@@ -20,7 +20,7 @@
           <span class="brand-mark" aria-hidden="true">▰</span>
           <span>Local PDF Redactor</span>
         </a>
-        <div class="privacy-badge" title="Files are processed only by this browser tab">
+        <div class="privacy-badge" title="Files are processed only in this app">
           <span aria-hidden="true">●</span> On-device processing
         </div>
         <button id="theme-toggle" class="theme-toggle" type="button" aria-pressed="true" aria-label="Switch to light mode">
@@ -42,7 +42,7 @@
         <input id="file-input" type="file" accept="application/pdf,.pdf" hidden />
         <div class="upload-icon" aria-hidden="true">↑</div>
         <p><strong>Drop a PDF here</strong> or <button id="browse-button" class="link-button" type="button">choose a file</button></p>
-        <span>PDF files only · processed in this browser</span>
+        <span>PDF files only · processed on this device</span>
       </section>
 
       <section id="workspace" class="workspace" hidden aria-label="PDF editor">
@@ -67,6 +67,7 @@
               </label>
               <button id="next-page" class="icon-button" type="button" aria-label="Next page">→</button>
             </div>
+            <div id="page-thumbnails" class="page-thumbnails" aria-label="Page thumbnails"></div>
           </div>
 
           <div class="sidebar-section instructions">
@@ -123,9 +124,27 @@
         <div class="security-icon" aria-hidden="true">⌁</div>
         <div>
           <strong>How this stays private</strong>
-          <p>Your file is read from your device into this browser tab’s memory. This app has no upload, account, analytics, cloud storage, or browser storage. Close the document or tab to clear it from the app; a PDF you download remains in your browser’s Downloads location. If Downloads syncs to a cloud service, choose a non-synced local destination for sensitive output.</p>
+          <p>Your file is read from your device into this app’s memory. This app has no upload, account, analytics, cloud storage, or browser storage. Close the document or app to clear it from memory. In the desktop build, choose a non-synced local folder in Save As for sensitive output.</p>
         </div>
       </section>
+
+      <dialog id="verification-dialog" class="verification-dialog" aria-labelledby="verification-title">
+        <div class="verification-header">
+          <div class="verification-seal" aria-hidden="true">✓</div>
+          <div>
+            <p class="eyebrow">EXPORT REVIEW</p>
+            <h2 id="verification-title">Technical checks passed</h2>
+          </div>
+        </div>
+        <p id="verification-summary" class="verification-summary"></p>
+        <div id="verification-stats" class="verification-stats" aria-label="Verification summary"></div>
+        <ul id="verification-checks" class="verification-checks"></ul>
+        <p class="verification-note">Review the visual coverage before sharing. Technical checks cannot know whether you missed a field that should have been redacted.</p>
+        <div class="dialog-actions">
+          <button id="return-to-editor" class="secondary-button" type="button">Return to editor</button>
+          <button id="save-verified" class="primary-button" type="button">Save verified PDF</button>
+        </div>
+      </dialog>
     </main>
     <script type="module" src="/src/main.js"></script>
   </body>

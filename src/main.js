@@ -20,6 +20,7 @@ const elements = {
   pageLabel: document.querySelector("#page-label"),
   pageNumber: document.querySelector("#page-number"),
   pageStage: document.querySelector("#page-stage"),
+  pageThumbnails: document.querySelector("#page-thumbnails"),
   previousPage: document.querySelector("#previous-page"),
   quality: document.querySelector("#quality"),
   redactionCount: document.querySelector("#redaction-count"),
@@ -28,6 +29,12 @@ const elements = {
   themeIcon: document.querySelector("#theme-icon"),
   themeLabel: document.querySelector("#theme-label"),
   themeToggle: document.querySelector("#theme-toggle"),
+  returnToEditor: document.querySelector("#return-to-editor"),
+  saveVerified: document.querySelector("#save-verified"),
+  verificationChecks: document.querySelector("#verification-checks"),
+  verificationDialog: document.querySelector("#verification-dialog"),
+  verificationStats: document.querySelector("#verification-stats"),
+  verificationSummary: document.querySelector("#verification-summary"),
   workspace: document.querySelector("#workspace"),
   zoom: document.querySelector("#zoom"),
 };
@@ -40,11 +47,16 @@ const state = {
   interaction: null,
   isExporting: false,
   loadingTask: null,
+  pendingExport: null,
   pdf: null,
   redactions: new Map(),
   renderTask: null,
   selectedId: null,
   theme: window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark",
+  thumbnailActivePage: null,
+  thumbnailObserver: null,
+  thumbnailRenderedOrder: [],
+  thumbnailRenderTasks: new Map(),
   zoom: 1,
 };
 
@@ -54,6 +66,10 @@ const MAX_PAGES = 250;
 const MAX_PREVIEW_PIXELS = 16 * 1024 * 1024;
 const MAX_EXPORT_PIXELS = 32 * 1024 * 1024;
 const MAX_TOTAL_EXPORT_PIXELS = 128 * 1024 * 1024;
+const MAX_OUTPUT_BYTES = 250 * 1024 * 1024;
+const MAX_THUMBNAIL_PIXELS = 220_000;
+const MAX_RENDERED_THUMBNAILS = 24;
+const MAX_VERIFICATION_PIXELS = 8 * 1024 * 1024;
 
 function setStatus(message, type = "") {
   elements.status.textContent = message;
@@ -99,6 +115,205 @@ function countRedactions() {
   return [...state.redactions.values()].reduce((total, rectangles) => total + rectangles.length, 0);
 }
 
+function hasPendingExport() {
+  return Boolean(state.pendingExport);
+}
+
+function normalizedBounds(rectangle, canvas, safetyBleed = 0) {
+  const left = Math.max(0, Math.floor(rectangle.x * canvas.width) - safetyBleed);
+  const top = Math.max(0, Math.floor(rectangle.y * canvas.height) - safetyBleed);
+  const right = Math.min(
+    canvas.width,
+    Math.ceil((rectangle.x + rectangle.width) * canvas.width) + safetyBleed,
+  );
+  const bottom = Math.min(
+    canvas.height,
+    Math.ceil((rectangle.y + rectangle.height) * canvas.height) + safetyBleed,
+  );
+  return { bottom, left, right, top };
+}
+
+function applyRedactionsToCanvas(context, canvas, rectangles, safetyBleed = 0) {
+  context.fillStyle = "#000000";
+  for (const rectangle of rectangles) {
+    const bounds = normalizedBounds(rectangle, canvas, safetyBleed);
+    context.fillRect(bounds.left, bounds.top, bounds.right - bounds.left, bounds.bottom - bounds.top);
+  }
+}
+
+function hasOpaqueBlackCoverage(context, bounds) {
+  const width = bounds.right - bounds.left;
+  const height = bounds.bottom - bounds.top;
+  if (width < 3 || height < 3) return false;
+  const inset = 1;
+  const left = bounds.left + inset;
+  const top = bounds.top + inset;
+  const right = bounds.right - 1 - inset;
+  const bottom = bounds.bottom - 1 - inset;
+  const samplePoints = [
+    [left, top],
+    [right, top],
+    [left, bottom],
+    [right, bottom],
+    [Math.floor((left + right) / 2), Math.floor((top + bottom) / 2)],
+  ];
+  return samplePoints.every(([x, y]) => {
+    const [red, green, blue, alpha] = context.getImageData(x, y, 1, 1).data;
+    return red <= 8 && green <= 8 && blue <= 8 && alpha >= 250;
+  });
+}
+
+function thumbnailButton(pageNumber) {
+  return elements.pageThumbnails.querySelector(`[data-page-number="${pageNumber}"]`);
+}
+
+function updateThumbnailBadge(pageNumber) {
+  const button = thumbnailButton(pageNumber);
+  if (!button) return;
+  const count = state.redactions.get(pageNumber)?.length ?? 0;
+  const badge = button.querySelector(".thumbnail-badge");
+  badge.hidden = count === 0;
+  badge.textContent = count ? String(count) : "";
+}
+
+function syncActiveThumbnail() {
+  if (state.thumbnailActivePage === state.currentPage) return;
+  thumbnailButton(state.thumbnailActivePage)?.removeAttribute("aria-current");
+  thumbnailButton(state.thumbnailActivePage)?.classList.remove("current");
+  const current = thumbnailButton(state.currentPage);
+  current?.setAttribute("aria-current", "page");
+  current?.classList.add("current");
+  state.thumbnailActivePage = state.currentPage;
+  if (current?.dataset.thumbnailState !== "rendered") renderThumbnail(state.currentPage, current);
+}
+
+function rememberRenderedThumbnail(pageNumber) {
+  state.thumbnailRenderedOrder = state.thumbnailRenderedOrder.filter((item) => item !== pageNumber);
+  state.thumbnailRenderedOrder.push(pageNumber);
+
+  while (state.thumbnailRenderedOrder.length > MAX_RENDERED_THUMBNAILS) {
+    const candidate = state.thumbnailRenderedOrder.shift();
+    if (candidate === state.currentPage) {
+      state.thumbnailRenderedOrder.push(candidate);
+      continue;
+    }
+    const button = thumbnailButton(candidate);
+    if (button?.dataset.thumbnailState === "rendered") {
+      const canvas = button.querySelector("canvas");
+      canvas.width = 1;
+      canvas.height = 1;
+      button.dataset.thumbnailState = "idle";
+    }
+  }
+}
+
+async function renderThumbnail(pageNumber, button, force = false) {
+  if (!state.pdf || !button || !button.isConnected || (!force && button.dataset.thumbnailState === "rendered")) return;
+  const existingRecord = state.thumbnailRenderTasks.get(pageNumber);
+  if (existingRecord) {
+    if (force) button.dataset.refreshThumbnail = "true";
+    return existingRecord.promise;
+  }
+
+  const documentSession = state.documentSession;
+  const pdf = state.pdf;
+  const canvas = button.querySelector("canvas");
+  const record = { cancelled: false, renderTask: null };
+  button.dataset.thumbnailState = "rendering";
+  state.thumbnailRenderTasks.set(pageNumber, record);
+  const task = Promise.resolve().then(async () => {
+    try {
+      const page = await pdf.getPage(pageNumber);
+      if (record.cancelled || documentSession !== state.documentSession || pdf !== state.pdf || !button.isConnected) return;
+      const baseViewport = page.getViewport({ scale: 1 });
+      const scale = Math.min(0.25, Math.sqrt(MAX_THUMBNAIL_PIXELS / (baseViewport.width * baseViewport.height)));
+      const viewport = page.getViewport({ scale });
+      const context = canvas.getContext("2d", { alpha: false });
+      canvas.width = Math.ceil(viewport.width);
+      canvas.height = Math.ceil(viewport.height);
+      record.renderTask = page.render({
+        annotationMode: pdfjsLib.AnnotationMode.DISABLE,
+        canvasContext: context,
+        viewport,
+      });
+      await record.renderTask.promise;
+      if (record.cancelled || documentSession !== state.documentSession || pdf !== state.pdf || !button.isConnected) return;
+      applyRedactionsToCanvas(context, canvas, state.redactions.get(pageNumber) ?? []);
+      button.dataset.thumbnailState = "rendered";
+      rememberRenderedThumbnail(pageNumber);
+    } catch (error) {
+      if (!record.cancelled && documentSession === state.documentSession && pdf === state.pdf && button.isConnected) {
+        button.dataset.thumbnailState = "failed";
+      }
+    } finally {
+      if (state.thumbnailRenderTasks.get(pageNumber) === record) state.thumbnailRenderTasks.delete(pageNumber);
+      if (button.dataset.refreshThumbnail === "true") {
+        button.dataset.refreshThumbnail = "";
+        renderThumbnail(pageNumber, button, true);
+      }
+    }
+  })();
+  record.promise = task;
+  return task;
+}
+
+function refreshThumbnail(pageNumber = state.currentPage) {
+  const button = thumbnailButton(pageNumber);
+  updateThumbnailBadge(pageNumber);
+  if (button?.dataset.thumbnailState === "rendered") renderThumbnail(pageNumber, button, true);
+}
+
+function setupThumbnails() {
+  state.thumbnailObserver?.disconnect();
+  state.thumbnailRenderTasks.clear();
+  state.thumbnailActivePage = null;
+  state.thumbnailRenderedOrder = [];
+  elements.pageThumbnails.replaceChildren();
+  if (!state.pdf) return;
+
+  const buttons = [];
+  const fragment = document.createDocumentFragment();
+  for (let pageNumber = 1; pageNumber <= state.pdf.numPages; pageNumber += 1) {
+    const button = document.createElement("button");
+    button.className = "thumbnail";
+    button.type = "button";
+    button.dataset.pageNumber = String(pageNumber);
+    button.setAttribute("aria-label", `Go to page ${pageNumber}`);
+
+    const canvas = document.createElement("canvas");
+    canvas.setAttribute("aria-hidden", "true");
+    const footer = document.createElement("span");
+    footer.className = "thumbnail-footer";
+    const label = document.createElement("span");
+    label.textContent = `Page ${pageNumber}`;
+    const badge = document.createElement("span");
+    badge.className = "thumbnail-badge";
+    badge.hidden = true;
+    footer.append(label, badge);
+    button.append(canvas, footer);
+    button.addEventListener("click", () => changePage(pageNumber));
+    fragment.append(button);
+    buttons.push(button);
+  }
+  elements.pageThumbnails.append(fragment);
+
+  if ("IntersectionObserver" in window) {
+    state.thumbnailObserver = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (!entry.isIntersecting) continue;
+          renderThumbnail(Number(entry.target.dataset.pageNumber), entry.target);
+        }
+      },
+      { root: elements.pageThumbnails, rootMargin: "180px 0px" },
+    );
+    buttons.forEach((button) => state.thumbnailObserver.observe(button));
+  } else {
+    buttons.slice(0, 8).forEach((button) => renderThumbnail(Number(button.dataset.pageNumber), button));
+  }
+  syncActiveThumbnail();
+}
+
 function updateControls() {
   const pageCount = state.pdf?.numPages ?? 1;
   const marked = countRedactions();
@@ -109,8 +324,9 @@ function updateControls() {
   elements.previousPage.disabled = state.currentPage <= 1;
   elements.nextPage.disabled = state.currentPage >= pageCount;
   elements.deleteRedaction.disabled = !state.selectedId;
-  elements.exportButton.disabled = !state.pdf || marked === 0 || state.isExporting;
+  elements.exportButton.disabled = !state.pdf || marked === 0 || state.isExporting || hasPendingExport();
   elements.redactionCount.textContent = `${marked} block${marked === 1 ? "" : "s"} marked`;
+  syncActiveThumbnail();
 }
 
 function redactionElement(rectangle) {
@@ -132,6 +348,7 @@ function redactionElement(rectangle) {
 
 function paintRedactions() {
   elements.redactionLayer.replaceChildren(...rectanglesForPage().map(redactionElement));
+  updateThumbnailBadge(state.currentPage);
   updateControls();
 }
 
@@ -209,7 +426,7 @@ async function renderCurrentPage() {
 }
 
 function changePage(requestedPage) {
-  if (!state.pdf || state.isExporting) return;
+  if (!state.pdf || state.isExporting || hasPendingExport()) return;
   const page = Math.round(Number(requestedPage));
   if (!Number.isFinite(page)) {
     updateControls();
@@ -222,7 +439,7 @@ function changePage(requestedPage) {
 }
 
 function removeSelectedRedaction() {
-  if (!state.selectedId) return;
+  if (!state.selectedId || state.isExporting || hasPendingExport()) return;
   const location = findRectangle(state.selectedId);
   if (location) {
     state.redactions.set(
@@ -232,11 +449,12 @@ function removeSelectedRedaction() {
   }
   state.selectedId = null;
   paintRedactions();
+  refreshThumbnail(location?.page);
   setStatus("Redaction block removed.");
 }
 
 function beginInteraction(event) {
-  if (event.button !== 0 || !state.pdf || state.isExporting) return;
+  if (event.button !== 0 || !state.pdf || state.isExporting || hasPendingExport()) return;
   const point = getLayerPoint(event);
   const block = event.target.closest(".redaction");
   const handle = event.target.closest(".resize-handle");
@@ -315,10 +533,15 @@ function finishInteraction(event) {
   }
   state.interaction = null;
   paintRedactions();
+  refreshThumbnail();
 }
 
 async function loadFile(file) {
   if (!file) return;
+  if (hasPendingExport()) {
+    setStatus("Finish or dismiss the verification review before opening another document.", "error");
+    return;
+  }
   if (file.type !== "application/pdf" && !file.name.toLowerCase().endsWith(".pdf")) {
     setStatus("Choose a PDF file (.pdf).", "error");
     return;
@@ -360,7 +583,9 @@ async function loadFile(file) {
     elements.fileMeta.textContent = `${state.pdf.numPages} page${state.pdf.numPages === 1 ? "" : "s"} · ${formatBytes(file.size)}`;
     elements.dropZone.hidden = true;
     elements.workspace.hidden = false;
+    setupThumbnails();
     updateControls();
+    elements.workspace.scrollIntoView({ block: "start" });
     await renderCurrentPage();
   } catch (error) {
     if (documentSession !== state.documentSession) return;
@@ -380,6 +605,7 @@ async function loadFile(file) {
 }
 
 function clearDocument() {
+  discardPendingExport();
   state.documentSession += 1;
   cancelRender();
   state.loadingTask?.destroy?.();
@@ -391,10 +617,20 @@ function clearDocument() {
   state.pdf = null;
   state.redactions = new Map();
   state.selectedId = null;
+  state.thumbnailObserver?.disconnect();
+  state.thumbnailObserver = null;
+  for (const record of state.thumbnailRenderTasks.values()) {
+    record.cancelled = true;
+    record.renderTask?.cancel();
+  }
+  state.thumbnailRenderTasks.clear();
+  state.thumbnailActivePage = null;
+  state.thumbnailRenderedOrder = [];
   elements.fileInput.value = "";
   elements.canvas.width = 1;
   elements.canvas.height = 1;
   elements.redactionLayer.replaceChildren();
+  elements.pageThumbnails.replaceChildren();
   elements.workspace.hidden = true;
   elements.dropZone.hidden = false;
   updateControls();
@@ -406,20 +642,206 @@ function canvasToBlob(canvas) {
   });
 }
 
-async function createRedactedPdf() {
-  if (!state.pdf || !state.file) return;
-  const redactionTotal = countRedactions();
+async function verifySerializedRedactions(page, rectangles) {
+  if (!rectangles.length) return 0;
+  const baseViewport = page.getViewport({ scale: 1 });
+  const scale = Math.min(
+    2,
+    Math.sqrt(MAX_VERIFICATION_PIXELS / (baseViewport.width * baseViewport.height)),
+  );
+  const viewport = page.getViewport({ scale });
+  const canvas = document.createElement("canvas");
+  const context = canvas.getContext("2d", { alpha: false });
+  canvas.width = Math.ceil(viewport.width);
+  canvas.height = Math.ceil(viewport.height);
+
+  try {
+    await page.render({
+      annotationMode: pdfjsLib.AnnotationMode.DISABLE,
+      canvasContext: context,
+      viewport,
+    }).promise;
+    for (const rectangle of rectangles) {
+      if (!hasOpaqueBlackCoverage(context, normalizedBounds(rectangle, canvas))) {
+        throw new UserFacingError("A redaction block could not be verified in the finished PDF.");
+      }
+    }
+    return rectangles.length;
+  } finally {
+    canvas.width = 1;
+    canvas.height = 1;
+  }
+}
+
+async function verifyGeneratedPdf(bytes, expectedPageCount, expectedRedactions) {
+  const expectedRedactionCount = [...expectedRedactions.values()].reduce(
+    (count, rectangles) => count + rectangles.length,
+    0,
+  );
+  const verificationBytes = new Uint8Array(bytes).slice();
+  const loadingTask = pdfjsLib.getDocument({
+    data: verificationBytes,
+    disableAutoFetch: true,
+    disableRange: true,
+    enableScripting: false,
+    enableXfa: false,
+    isEvalSupported: false,
+    stopAtErrors: false,
+  });
+
+  try {
+    const outputPdf = await loadingTask.promise;
+    let annotationCount = 0;
+    let pageJavaScriptActionCount = 0;
+    let searchableTextCount = 0;
+    let verifiedRedactionCount = 0;
+    for (let pageNumber = 1; pageNumber <= outputPdf.numPages; pageNumber += 1) {
+      const page = await outputPdf.getPage(pageNumber);
+      const [annotations, text, pageJavaScriptActions] = await Promise.all([
+        page.getAnnotations({ intent: "any" }),
+        page.getTextContent(),
+        page.getJSActions?.(),
+      ]);
+      annotationCount += annotations.length;
+      searchableTextCount += text.items.length;
+      pageJavaScriptActionCount += Object.keys(pageJavaScriptActions ?? {}).length;
+      verifiedRedactionCount += await verifySerializedRedactions(
+        page,
+        expectedRedactions.get(pageNumber) ?? [],
+      );
+    }
+    const attachments = await outputPdf.getAttachments();
+    const fields = await outputPdf.getFieldObjects?.();
+    const javaScriptActions = await outputPdf.getJSActions?.();
+    const attachmentCount = Object.keys(attachments ?? {}).length;
+    const fieldCount = Object.keys(fields ?? {}).length;
+    const javaScriptActionCount = Object.keys(javaScriptActions ?? {}).length + pageJavaScriptActionCount;
+    const checksPassed =
+      outputPdf.numPages === expectedPageCount &&
+      searchableTextCount === 0 &&
+      annotationCount === 0 &&
+      attachmentCount === 0 &&
+      fieldCount === 0 &&
+      javaScriptActionCount === 0 &&
+      verifiedRedactionCount === expectedRedactionCount;
+
+    if (!checksPassed) {
+      throw new UserFacingError("The generated PDF did not pass technical verification and was not saved.");
+    }
+
+    return {
+      annotationCount,
+      attachmentCount,
+      fieldCount,
+      javaScriptActionCount,
+      pageCount: outputPdf.numPages,
+      redactionCount: expectedRedactionCount,
+      searchableTextCount,
+      verifiedRedactionCount,
+    };
+  } finally {
+    await loadingTask.destroy();
+  }
+}
+
+function addVerificationStat(value, label) {
+  const item = document.createElement("div");
+  item.className = "verification-stat";
+  const number = document.createElement("strong");
+  number.textContent = String(value);
+  const caption = document.createElement("span");
+  caption.textContent = label;
+  item.append(number, caption);
+  return item;
+}
+
+function addVerificationCheck(label, detail) {
+  const item = document.createElement("li");
+  const icon = document.createElement("span");
+  icon.className = "verification-check-icon";
+  icon.setAttribute("aria-hidden", "true");
+  icon.textContent = "✓";
+  const text = document.createElement("span");
+  const title = document.createElement("strong");
+  title.textContent = label;
+  const description = document.createElement("small");
+  description.textContent = detail;
+  text.append(title, description);
+  item.append(icon, text);
+  return item;
+}
+
+function showVerificationDialog(report) {
   const markedPages = [...state.redactions.values()].filter((rectangles) => rectangles.length > 0).length;
+  elements.verificationSummary.textContent = "A fresh, flattened PDF is ready. Nothing has been written to disk yet.";
+  elements.verificationStats.replaceChildren(
+    addVerificationStat(report.pageCount, "pages flattened"),
+    addVerificationStat(markedPages, "pages marked"),
+    addVerificationStat(report.redactionCount, "blocks applied"),
+  );
+  elements.verificationChecks.replaceChildren(
+    addVerificationCheck("No selectable text found", `${report.searchableTextCount} text items detected.`),
+    addVerificationCheck("No annotations or form fields found", `${report.annotationCount} annotations and ${report.fieldCount} form fields detected.`),
+    addVerificationCheck("No attachments or document JavaScript found", `${report.attachmentCount} attachments and ${report.javaScriptActionCount} script actions detected.`),
+    addVerificationCheck("Redaction coverage verified in the finished PDF", `${report.verifiedRedactionCount} black blocks sampled after serialization.`),
+    addVerificationCheck("Source metadata was not copied", "The output was created as a new document containing flattened page images."),
+  );
+  if (!elements.verificationDialog.open) elements.verificationDialog.showModal();
+  elements.saveVerified.focus();
+}
+
+function discardPendingExport() {
+  if (state.pendingExport?.bytes) state.pendingExport.bytes.fill(0);
+  state.pendingExport = null;
+  if (elements.verificationDialog.open) elements.verificationDialog.close();
+}
+
+function downloadInBrowser(bytes, fileName) {
+  const blob = new Blob([bytes], { type: "application/pdf" });
+  const download = document.createElement("a");
+  const objectUrl = URL.createObjectURL(blob);
+  download.href = objectUrl;
+  download.download = fileName;
+  document.body.append(download);
+  download.click();
+  download.remove();
+  window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1_000);
+}
+
+async function saveVerifiedExport() {
+  const pendingExport = state.pendingExport;
+  if (!pendingExport) return;
+  elements.saveVerified.disabled = true;
+  elements.returnToEditor.disabled = true;
+  try {
+    if (typeof window.localPdfRedactor?.saveRedactedPdf === "function") {
+      const result = await window.localPdfRedactor.saveRedactedPdf(pendingExport.bytes, pendingExport.fileName);
+      if (result?.status === "cancelled") {
+        setStatus("Save cancelled. Choose Save verified PDF when you are ready.");
+        return;
+      }
+      if (result?.status !== "saved") throw new Error("Unexpected save result.");
+      setStatus("Verified redacted PDF saved to the location you selected.", "success");
+    } else {
+      downloadInBrowser(pendingExport.bytes, pendingExport.fileName);
+      setStatus("Verified redacted PDF downloaded. Check your browser's Downloads location.", "success");
+    }
+    discardPendingExport();
+  } catch (error) {
+    console.error(error);
+    setStatus("The verified PDF could not be saved. Check the selected folder for an incomplete .partial file, then try again.", "error");
+  } finally {
+    elements.saveVerified.disabled = false;
+    elements.returnToEditor.disabled = false;
+    updateControls();
+  }
+}
+
+async function createRedactedPdf() {
+  if (!state.pdf || !state.file || hasPendingExport()) return;
+  const redactionTotal = countRedactions();
   if (redactionTotal === 0) {
     setStatus("Mark at least one block before creating a redacted PDF.", "error");
-    return;
-  }
-  if (
-    !window.confirm(
-      `Review complete? This will export ${redactionTotal} redaction block${redactionTotal === 1 ? "" : "s"} across ${markedPages} page${markedPages === 1 ? "" : "s"}. The result will be flattened and cannot be edited as text.`,
-    )
-  ) {
-    setStatus("Export cancelled so you can continue reviewing the marked blocks.");
     return;
   }
 
@@ -440,6 +862,7 @@ async function createRedactedPdf() {
   elements.quality.disabled = true;
   elements.zoom.disabled = true;
   elements.redactionLayer.style.pointerEvents = "none";
+  let generatedBytes = null;
 
   try {
     setStatus("Creating a new flattened PDF… 0%");
@@ -475,13 +898,12 @@ async function createRedactedPdf() {
         canvasContext: context,
         viewport: exportViewport,
       }).promise;
-      context.fillStyle = "#000000";
-      for (const rectangle of exportRedactions.get(pageNumber) ?? []) {
-        const left = Math.max(0, Math.floor(rectangle.x * exportCanvas.width) - 1);
-        const top = Math.max(0, Math.floor(rectangle.y * exportCanvas.height) - 1);
-        const right = Math.min(exportCanvas.width, Math.ceil((rectangle.x + rectangle.width) * exportCanvas.width) + 1);
-        const bottom = Math.min(exportCanvas.height, Math.ceil((rectangle.y + rectangle.height) * exportCanvas.height) + 1);
-        context.fillRect(left, top, right - left, bottom - top);
+      const pageRedactions = exportRedactions.get(pageNumber) ?? [];
+      applyRedactionsToCanvas(context, exportCanvas, pageRedactions, 1);
+      for (const rectangle of pageRedactions) {
+        if (!hasOpaqueBlackCoverage(context, normalizedBounds(rectangle, exportCanvas, 1))) {
+          throw new UserFacingError("A redaction block could not be verified. No output was saved.");
+        }
       }
 
       const png = await canvasToBlob(exportCanvas);
@@ -498,17 +920,23 @@ async function createRedactedPdf() {
       setStatus(`Creating a new flattened PDF… ${Math.round((pageNumber / pdf.numPages) * 100)}%`);
     }
 
-    const bytes = await output.save({ useObjectStreams: true });
-    const blob = new Blob([bytes], { type: "application/pdf" });
-    const download = document.createElement("a");
-    download.href = URL.createObjectURL(blob);
-    download.download = redactedFileName(file.name);
-    document.body.append(download);
-    download.click();
-    download.remove();
-    window.setTimeout(() => URL.revokeObjectURL(download.href), 1_000);
-    setStatus("Redacted PDF created and downloaded. The original content is not included in the new file.", "success");
+    generatedBytes = new Uint8Array(await output.save({ useObjectStreams: true }));
+    if (generatedBytes.byteLength > MAX_OUTPUT_BYTES) {
+      throw new UserFacingError(
+        `The generated PDF is ${formatBytes(generatedBytes.byteLength)}, above the ${formatBytes(MAX_OUTPUT_BYTES)} safety limit. Choose a lower export quality.`,
+      );
+    }
+    const report = await verifyGeneratedPdf(generatedBytes, pdf.numPages, exportRedactions);
+    state.pendingExport = {
+      bytes: generatedBytes,
+      fileName: redactedFileName(file.name),
+      report,
+    };
+    generatedBytes = null;
+    showVerificationDialog(report);
+    setStatus("Technical checks passed. Review the report before saving.", "success");
   } catch (error) {
+    generatedBytes?.fill(0);
     console.error(error);
     setStatus(
       error instanceof UserFacingError
@@ -538,6 +966,7 @@ elements.browseButton.addEventListener("click", () => elements.fileInput.click()
 elements.themeToggle.addEventListener("click", () => applyTheme(state.theme === "dark" ? "light" : "dark"));
 elements.fileInput.addEventListener("change", (event) => loadFile(event.target.files?.[0]));
 elements.closeDocument.addEventListener("click", () => {
+  if (hasPendingExport()) return;
   clearDocument();
   setStatus("Document closed. It is no longer held by this app.");
 });
@@ -546,6 +975,18 @@ elements.nextPage.addEventListener("click", () => changePage(state.currentPage +
 elements.pageNumber.addEventListener("change", (event) => changePage(event.target.value));
 elements.deleteRedaction.addEventListener("click", removeSelectedRedaction);
 elements.exportButton.addEventListener("click", createRedactedPdf);
+elements.returnToEditor.addEventListener("click", () => {
+  discardPendingExport();
+  updateControls();
+  setStatus("Verification review dismissed. You can continue editing.");
+});
+elements.saveVerified.addEventListener("click", saveVerifiedExport);
+elements.verificationDialog.addEventListener("cancel", (event) => {
+  event.preventDefault();
+  discardPendingExport();
+  updateControls();
+  setStatus("Verification review dismissed. You can continue editing.");
+});
 elements.zoom.addEventListener("change", (event) => {
   state.zoom = Number(event.target.value);
   if (state.pdf) renderCurrentPage();
@@ -574,6 +1015,7 @@ elements.dropZone.addEventListener("drop", (event) => {
 });
 
 document.addEventListener("keydown", (event) => {
+  if (state.isExporting || hasPendingExport()) return;
   const tagName = document.activeElement?.tagName;
   if ((event.key === "Delete" || event.key === "Backspace") && tagName !== "INPUT" && tagName !== "SELECT") {
     if (state.selectedId) {

@@ -9,7 +9,9 @@
     "build": "vite build",
     "preview": "vite preview",
     "app": "npm run build && electron .",
-    "package:windows": "npm run build && electron-builder --win portable"
+    "package:installer": "npm run build && electron-builder --win nsis",
+    "package:portable": "npm run build && electron-builder --win portable",
+    "package:windows": "npm run build && electron-builder --win"
   },
   "dependencies": {
     "pdf-lib": "1.17.1",
@@ -35,12 +37,23 @@
     "win": {
       "target": [
         {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
           "target": "portable",
           "arch": [
             "x64"
           ]
         }
       ]
+    },
+    "nsis": {
+      "allowToChangeInstallationDirectory": true,
+      "oneClick": false,
+      "perMachine": false
     }
   }
 }
